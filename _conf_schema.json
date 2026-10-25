@@ -12,6 +12,12 @@
     "default": 300,
     "hint": "最小 60 秒。设置过小可能触发 API 限流(429)。"
   },
+  "min_push_gap": {
+    "description": "同一会话两次推送的最小间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "推送节流：间隔不足时自动等待，避免短时间内向同一个群连续发送大量消息。0 表示不节流。"
+  },
   "notify_new_reset": {
     "description": "推送：新重置发生",
     "type": "bool",

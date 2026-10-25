@@ -10,6 +10,7 @@
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -66,6 +67,8 @@ class CodexResetPlugin(Star):
         self._state = {}
         self._stopping = False
         self._poll_task = None
+        # 各会话上次广播的时间（monotonic 秒），用于推送节流；仅内存，重启清零
+        self._last_push_at = {}
 
     # ---------- 生命周期 ----------
 
@@ -160,6 +163,12 @@ class CodexResetPlugin(Star):
         except (TypeError, ValueError):
             return 300
 
+    def _min_push_gap(self) -> int:
+        try:
+            return max(0, int(self.config.get("min_push_gap", 60) or 0))
+        except (TypeError, ValueError):
+            return 60
+
     async def _poll_loop(self):
         # 启动后先等片刻，避开 AstrBot 初始化高峰
         await asyncio.sleep(10)
@@ -239,14 +248,33 @@ class CodexResetPlugin(Star):
                 self._etag = None
 
     async def _broadcast(self, text: str) -> bool:
-        """向所有订阅会话推送；返回是否至少成功一个"""
+        """向所有订阅会话推送（带节流）：该会话若有订阅成员，则在消息前 @ 他们；返回是否至少成功一个
+
+        节流规则：同一会话两次推送间隔不足 min_push_gap 秒时，等待补足间隔再发；
+        群与群之间额外间隔 3 秒，避免短时间内向多个会话连发。
+        """
         targets = [t for t in (self.config.get("push_targets") or []) if t]
         if not targets:
             return True  # 无订阅目标时视为无需推送，正常落盘
+        at_map = self._state.get("at_members", {})
+        gap = self._min_push_gap()
         ok = False
-        for umo in targets:
+        for idx, umo in enumerate(targets):
             try:
-                await self.context.send_message(umo, MessageChain().message(text))
+                # 单会话节流：距上次推送不足 gap 秒则等待
+                if gap > 0:
+                    wait = self._last_push_at.get(umo, 0.0) + gap - time.monotonic()
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                # 多会话之间的小间隔（首个会话不等待）
+                if idx > 0:
+                    await asyncio.sleep(3)
+                chain = MessageChain()
+                for qq in at_map.get(umo, []):
+                    chain = chain.at("", qq)
+                chain.message(text)
+                await self.context.send_message(umo, chain)
+                self._last_push_at[umo] = time.monotonic()
                 ok = True
             except Exception as e:
                 logger.warning(f"[codex_reset] 推送到 {umo} 失败：{e}")
@@ -357,20 +385,81 @@ class CodexResetPlugin(Star):
 
     # ---------- 指令 ----------
 
+    def _at_members(self, umo: str) -> list:
+        """返回本会话已订阅 @ 提醒的成员 ID 列表"""
+        return list((self._state.get("at_members") or {}).get(umo) or [])
+
+    def _set_at_members(self, umo: str, members: list) -> bool:
+        """更新并持久化本会话的 @ 提醒成员列表；空列表时移除该键。返回是否写盘成功"""
+        at_map = self._state.get("at_members")
+        if not isinstance(at_map, dict):
+            at_map = {}
+            self._state["at_members"] = at_map
+        if members:
+            at_map[umo] = members
+        else:
+            at_map.pop(umo, None)
+        return self._save_state(self._state)
+
     @filter.command("codex")
     async def codex(self, event: AstrMessageEvent):
-        """查询 Codex 重置状态；/codex 订阅 开启本会话推送，/codex 退订 关闭"""
+        """Codex 重置推送：/codex 查询状态；/codex 订阅|退订 本会话推送；/codex 订阅成员|退订成员 @提醒（仅操作自己，不能帮别人订阅）；/codex 订阅详情 查看订阅状态"""
         raw = (event.message_str or "").strip()
-        action = ""
-        for tok in raw.split():
-            if tok.strip("/").lower() in ("codex", "codex_reset", "reset", "cx"):
-                continue
-            action = tok.lower()
-            break
+        tokens = [
+            t for t in raw.split()
+            if t.strip("/").lower() not in ("codex", "codex_reset", "reset", "cx")
+        ]
+        action = tokens[0].lower() if tokens else ""
+        # 兼容把"订阅成员"拆成两个词的输入，如 "/codex 订阅 成员"
+        if len(tokens) > 1 and tokens[1] == "成员" and action in ("订阅", "退订"):
+            action += "成员"
+
+        umo = event.unified_msg_origin
+        targets = list(self.config.get("push_targets") or [])
+
+        # 注意：包含关系的分支必须按长短顺序判断（"订阅成员"包含"订阅"）
+        if "退订成员" in action or action in ("unsubme", "unsub_me"):
+            sender = str(event.get_sender_id())
+            members = self._at_members(umo)
+            if sender in members:
+                members.remove(sender)
+                ok = self._set_at_members(umo, members)
+                tail = "" if ok else "\n⚠️ 状态保存失败，重启后订阅可能恢复。"
+                yield event.plain_result("🔕 已退订：推送时不再 @ 你。" + tail)
+            else:
+                yield event.plain_result("你尚未订阅 @ 提醒。")
+            return
+
+        if "订阅成员" in action or action in ("subme", "sub_me", "atme"):
+            sender = str(event.get_sender_id())
+            members = self._at_members(umo)
+            ok = True
+            if sender not in members:
+                members.append(sender)
+                ok = self._set_at_members(umo, members)
+            tip = "🔔 已订阅 @ 提醒：新重置发生 / 宣布排期 / 出现预警 时会 @ 你。\n"
+            if umo not in targets:
+                tip += "⚠️ 本会话尚未订阅推送，请先发送 /codex 订阅。"
+            if not ok:
+                tip += "\n⚠️ 状态保存失败，重启后订阅可能丢失。"
+            yield event.plain_result(tip)
+            return
+
+        if "订阅详情" in action or action in ("subinfo",):
+            members = self._at_members(umo)
+            lines = [
+                "📋 本会话订阅状态：",
+                f"• 会话推送：{'✅ 已订阅' if umo in targets else '❌ 未订阅（发送 /codex 订阅 开启）'}",
+            ]
+            if members:
+                lines.append(f"• @ 提醒成员：{'、'.join(members)}")
+            else:
+                lines.append("• @ 提醒成员：无（成员可发送 /codex 订阅成员 自助订阅）")
+            lines.append(CREDIT)
+            yield event.plain_result("\n".join(lines))
+            return
 
         if "退订" in action or action in ("off", "unsub", "unsubscribe"):
-            umo = event.unified_msg_origin
-            targets = list(self.config.get("push_targets") or [])
             if umo in targets:
                 targets.remove(umo)
                 self.config["push_targets"] = targets
@@ -381,8 +470,6 @@ class CodexResetPlugin(Star):
             return
 
         if "订阅" in action or action in ("on", "sub", "subscribe"):
-            umo = event.unified_msg_origin
-            targets = list(self.config.get("push_targets") or [])
             if umo not in targets:
                 targets.append(umo)
                 self.config["push_targets"] = targets
@@ -390,6 +477,7 @@ class CodexResetPlugin(Star):
             yield event.plain_result(
                 "🔔 已订阅本会话的 Codex 重置推送：\n"
                 "• 新重置发生 / 宣布排期 / 出现预警 时自动通报\n"
+                "• 群成员可发送 /codex 订阅成员 让推送时 @ 自己\n"
                 f"• 当前轮询间隔 {self._poll_interval()} 秒\n"
                 f"{CREDIT}"
             )
