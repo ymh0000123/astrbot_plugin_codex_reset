@@ -1,0 +1,6 @@
+# Python 运行产物
+__pycache__/
+*.pyc
+
+# 本地打包文件
+*.zip

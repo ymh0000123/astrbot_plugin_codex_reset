@@ -1,0 +1,30 @@
+{
+  "push_targets": {
+    "description": "推送目标会话列表（unified_msg_origin）",
+    "type": "list",
+    "default": [],
+    "hint": "格式如 aiocqhttp:GroupMessage:123456。推荐直接在目标群里发送 /codex 订阅 自动添加。",
+    "obvious_hint": true
+  },
+  "poll_interval": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "最小 60 秒。设置过小可能触发 API 限流(429)。"
+  },
+  "notify_new_reset": {
+    "description": "推送：新重置发生",
+    "type": "bool",
+    "default": true
+  },
+  "notify_scheduled": {
+    "description": "推送：宣布重置排期",
+    "type": "bool",
+    "default": true
+  },
+  "notify_watch": {
+    "description": "推送：出现重置预警",
+    "type": "bool",
+    "default": true
+  }
+}

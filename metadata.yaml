@@ -1,0 +1,7 @@
+name: astrbot_plugin_codex_reset
+display_name: Codex 重置订阅
+desc: 订阅并推送 OpenAI Codex 用量重置动态：定时向指定会话推送新重置/排期/预警，支持 /codex 指令查询与 AI 工具调用（数据来自 codex-resets.com 公开 API）。
+short_desc: 向指定群推送 Codex 重置动态，支持 AI 调用查询。
+version: 1.0.0
+author: ad
+repo: https://github.com/ymh0000123/astrbot_plugin_codex_reset
